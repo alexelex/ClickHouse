@@ -476,6 +476,7 @@ private:
 
     /// Quorum state taken at some later time than prev_virtual_parts.
     String inprogress_quorum_part;
+    std::set<String> inprogress_quorum_parts;
 
     int32_t merges_version = -1;
 };

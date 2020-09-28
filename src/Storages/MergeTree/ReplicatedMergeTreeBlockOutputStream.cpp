@@ -1,5 +1,6 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeQuorumParallelEntry.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeBlockOutputStream.h>
 #include <Interpreters/PartLog.h>
 #include <DataStreams/IBlockOutputStream.h>
@@ -39,12 +40,14 @@ ReplicatedMergeTreeBlockOutputStream::ReplicatedMergeTreeBlockOutputStream(
     size_t quorum_,
     size_t quorum_timeout_ms_,
     size_t max_parts_per_block_,
+    bool quorum_parallel_,
     bool deduplicate_)
     : storage(storage_)
     , metadata_snapshot(metadata_snapshot_)
     , quorum(quorum_)
     , quorum_timeout_ms(quorum_timeout_ms_)
     , max_parts_per_block(max_parts_per_block_)
+    , quorum_parallel(quorum_parallel_)
     , deduplicate(deduplicate_)
     , log(&Poco::Logger::get(storage.getLogName() + " (Replicated OutputStream)"))
 {
@@ -74,10 +77,12 @@ static void assertSessionIsNotExpired(zkutil::ZooKeeperPtr & zookeeper)
 void ReplicatedMergeTreeBlockOutputStream::checkQuorumPrecondition(zkutil::ZooKeeperPtr & zookeeper)
 {
     quorum_info.status_path = storage.zookeeper_path + "/quorum/status";
+    quorum_info.quorum_parallel_path = storage.zookeeper_path + "/quorum/parallel";
 
     std::future<Coordination::GetResponse> quorum_status_future = zookeeper->asyncTryGet(quorum_info.status_path);
     std::future<Coordination::GetResponse> is_active_future = zookeeper->asyncTryGet(storage.replica_path + "/is_active");
     std::future<Coordination::GetResponse> host_future = zookeeper->asyncTryGet(storage.replica_path + "/host");
+    std::future<Coordination::GetResponse> parallel_status_future = zookeeper->asyncTryGet(quorum_info.quorum_parallel_path);
 
     /// List of live replicas. All of them register an ephemeral node for leader_election.
 
@@ -99,8 +104,27 @@ void ReplicatedMergeTreeBlockOutputStream::checkQuorumPrecondition(zkutil::ZooKe
 
     auto quorum_status = quorum_status_future.get();
     if (quorum_status.error != Coordination::Error::ZNONODE)
-        throw Exception("Quorum for previous write has not been satisfied yet. Status: " + quorum_status.data,
+        throw Exception("Quorum for previous parallel quorum write has not been satisfied yet. Status: " + quorum_status.data,
                         ErrorCodes::UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE);
+
+    // ALEXELEXA: what if status added after that and before that, and we have parallel write?
+
+    auto parallel_status = parallel_status_future.get();
+    if (parallel_status.error == Coordination::Error::ZOK)
+    {
+        ReplicatedMergeTreeQuorumParallelEntry parallel_entry;
+        parallel_entry.fromString(parallel_status.data);
+
+        if (!quorum_parallel && parallel_entry.part_names.size())
+        {
+            throw Exception("Unparallel quorum write can't start while quorum for previous "
+                            "write has not been satisfied yet. Status: " + parallel_status.data,
+                            ErrorCodes::UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE);
+        }
+        else if (quorum_parallel && parallel_entry.part_names.size() > 0 && !parallel_entry.is_parallel)
+            throw Exception("Quorum for previous unparallel quorum write has not been satisfied yet",
+                            ErrorCodes::UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE);
+    }
 
     /// Both checks are implicitly made also later (otherwise there would be a race condition).
 
@@ -113,6 +137,9 @@ void ReplicatedMergeTreeBlockOutputStream::checkQuorumPrecondition(zkutil::ZooKe
     quorum_info.is_active_node_value = is_active.data;
     quorum_info.is_active_node_version = is_active.stat.version;
     quorum_info.host_node_version = host.stat.version;
+    quorum_info.quorum_parallel_value = parallel_status.data;
+    quorum_info.quorum_parallel_version = parallel_status.stat.version;
+    LOG_INFO(log, "quorum_parallel_value: {}\nquorum_parallel_version: {}\n", parallel_status.data, parallel_status.stat.version);
 }
 
 
@@ -224,6 +251,9 @@ void ReplicatedMergeTreeBlockOutputStream::commitPart(
     size_t loop_counter = 0;
     constexpr size_t max_iterations = 10;
 
+    /// There is one more case when we need to retry transaction in a loop.
+    size_t parallel_quorum_loop_counter = 0;
+
     bool is_already_existing_part = false;
 
     while (true)
@@ -287,12 +317,35 @@ void ReplicatedMergeTreeBlockOutputStream::commitPart(
                 quorum_entry.required_number_of_replicas = quorum;
                 quorum_entry.replicas.insert(storage.replica_name);
 
+                ReplicatedMergeTreeQuorumParallelEntry parallel_entry;
+                parallel_entry.fromString(quorum_info.quorum_parallel_value);
+
+                if (quorum_parallel)
+                {
+                    auto quorum_status_id = part->name;
+                    quorum_info.status_path += quorum_status_id;
+
+                    if (parallel_entry.part_names.count(quorum_status_id))
+                        throw Exception("Quorum for part " + quorum_status_id + " has been already started.",
+                                        ErrorCodes::DUPLICATE_DATA_PART);
+                    parallel_entry.is_parallel = true;
+                }
+
+                parallel_entry.is_parallel = quorum_parallel;
+                parallel_entry.part_names.insert(part->name);
+
                 /** At this point, this node will contain information that the current replica received a part.
                     * When other replicas will receive this part (in the usual way, processing the replication log),
                     *  they will add themselves to the contents of this node.
                     * When it contains information about `quorum` number of replicas, this node is deleted,
                     *  which indicates that the quorum has been reached.
                     */
+               ops.emplace_back(
+                    zkutil::makeCheckRequest(
+                        quorum_info.quorum_parallel_path,
+                        quorum_info.quorum_parallel_version));
+
+                LOG_INFO(log, "path: {}\nversion: {}", quorum_info.quorum_parallel_path, quorum_info.quorum_parallel_version);
 
                 ops.emplace_back(
                     zkutil::makeCreateRequest(
@@ -314,6 +367,14 @@ void ReplicatedMergeTreeBlockOutputStream::commitPart(
                     zkutil::makeCheckRequest(
                         storage.replica_path + "/host",
                         quorum_info.host_node_version));
+
+                ops.emplace_back(
+                    zkutil::makeSetRequest(
+                        quorum_info.quorum_parallel_path,
+                        parallel_entry.toString(),
+                        quorum_info.quorum_parallel_version));
+
+                LOG_INFO(log, "new parallel_entry: {}", parallel_entry.toString());
             }
         }
         else
@@ -431,10 +492,26 @@ void ReplicatedMergeTreeBlockOutputStream::commitPart(
                 }
                 continue;
             }
-            else if (multi_code == Coordination::Error::ZNODEEXISTS && failed_op_path == quorum_info.status_path)
+            else if (multi_code == Coordination::Error::ZNODEEXISTS && failed_op_path == quorum_info.status_path) // ALEXELEXA: now it shouldn't be used
             {
                 transaction.rollback();
                 throw Exception("Another quorum insert has been already started", ErrorCodes::UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE);
+            }
+            else if (multi_code == Coordination::Error::ZBADVERSION && failed_op_path == quorum_info.quorum_parallel_path)
+            {
+                if (quorum_parallel)
+                {
+                    /// One of other parallel inserts might start at the same time
+                    /// Retry it some times, but not too much
+                    ++parallel_quorum_loop_counter;
+                    if (parallel_quorum_loop_counter != max_iterations)
+                    {
+                        checkQuorumPrecondition(zookeeper);
+                        continue;
+                    }
+                }
+                transaction.rollback();
+                throw Exception("Another quorum insert started at the same time", ErrorCodes::UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE);
             }
             else
             {
@@ -472,8 +549,6 @@ void ReplicatedMergeTreeBlockOutputStream::commitPart(
         /// We are waiting for quorum to be satisfied.
         LOG_TRACE(log, "Waiting for quorum");
 
-        String quorum_status_path = storage.zookeeper_path + "/quorum/status";
-
         try
         {
             while (true)
@@ -482,7 +557,7 @@ void ReplicatedMergeTreeBlockOutputStream::commitPart(
 
                 std::string value;
                 /// `get` instead of `exists` so that `watch` does not leak if the node is no longer there.
-                if (!zookeeper->tryGet(quorum_status_path, value, nullptr, event))
+                if (!zookeeper->tryGet(quorum_info.status_path, value, nullptr, event))
                     break;
 
                 ReplicatedMergeTreeQuorumEntry quorum_entry(value);

@@ -28,6 +28,7 @@ public:
         size_t quorum_,
         size_t quorum_timeout_ms_,
         size_t max_parts_per_block_,
+        bool quorum_parallel_,
         bool deduplicate_);
 
     Block getHeader() const override;
@@ -48,8 +49,11 @@ private:
     {
         String status_path;
         String is_active_node_value;
+        String quorum_parallel_path;
+        String quorum_parallel_value;
         int is_active_node_version = -1;
         int host_node_version = -1;
+        int quorum_parallel_version = -1;
     };
 
     QuorumInfo quorum_info;
@@ -64,9 +68,10 @@ private:
     size_t quorum_timeout_ms;
     size_t max_parts_per_block;
 
+    bool quorum_parallel = false;
     bool deduplicate = true;
     bool last_block_is_duplicate = false;
-
+    
     using Logger = Poco::Logger;
     Poco::Logger * log;
 };

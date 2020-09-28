@@ -5,6 +5,7 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeQuorumParallelEntry.h>
 #include <Common/StringUtils/StringUtils.h>
 
 
@@ -1699,6 +1700,7 @@ ReplicatedMergeTreeMergePredicate::ReplicatedMergeTreeMergePredicate(
 
     /// Load current quorum status.
     auto quorum_status_future = zookeeper->asyncTryGet(queue.zookeeper_path + "/quorum/status");
+    auto parallel_status_future = zookeeper->asyncTryGet(queue.zookeeper_path + "/quorum/parallel");
 
     /// Load current inserts
     std::unordered_set<String> lock_holder_paths;
@@ -1757,9 +1759,19 @@ ReplicatedMergeTreeMergePredicate::ReplicatedMergeTreeMergePredicate(
         ReplicatedMergeTreeQuorumEntry quorum_status;
         quorum_status.fromString(quorum_status_response.data);
         inprogress_quorum_part = quorum_status.part_name;
+        inprogress_quorum_parts.clear();
     }
     else
+    {
         inprogress_quorum_part.clear();
+        Coordination::GetResponse parallel_status_response = parallel_status_future.get();
+        if (parallel_status_response.error == Coordination::Error::ZOK)
+        {
+            ReplicatedMergeTreeQuorumParallelEntry parallel_entry;
+            parallel_entry.fromString(parallel_status_response.data);
+            inprogress_quorum_parts = parallel_entry.part_names;
+        }
+    }
 }
 
 bool ReplicatedMergeTreeMergePredicate::operator()(
@@ -1821,7 +1833,7 @@ bool ReplicatedMergeTreeMergePredicate::canMergeTwoParts(
 
     for (const MergeTreeData::DataPartPtr & part : {left, right})
     {
-        if (part->name == inprogress_quorum_part)
+        if (part->name == inprogress_quorum_part || inprogress_quorum_parts.count(part->name))
         {
             if (out_reason)
                 *out_reason = "Quorum insert for part " + part->name + " is currently in progress";
@@ -1916,7 +1928,7 @@ bool ReplicatedMergeTreeMergePredicate::canMergeSinglePart(
     const MergeTreeData::DataPartPtr & part,
     String * out_reason) const
 {
-    if (part->name == inprogress_quorum_part)
+    if (part->name == inprogress_quorum_part || inprogress_quorum_parts.count(part->name))
     {
         if (out_reason)
             *out_reason = "Quorum insert for part " + part->name + " is currently in progress";
@@ -1957,7 +1969,7 @@ std::optional<std::pair<Int64, int>> ReplicatedMergeTreeMergePredicate::getDesir
 
     /// We cannot mutate part if it's being inserted with quorum and it's not
     /// already reached.
-    if (part->name == inprogress_quorum_part)
+    if (part->name == inprogress_quorum_part || inprogress_quorum_parts.count(part->name))
         return {};
 
     std::lock_guard lock(queue.state_mutex);

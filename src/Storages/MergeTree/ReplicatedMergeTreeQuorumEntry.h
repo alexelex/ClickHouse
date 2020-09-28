@@ -21,6 +21,7 @@ struct ReplicatedMergeTreeQuorumEntry
 {
     String part_name;
     size_t required_number_of_replicas{};
+    bool is_parallel = false;
     std::set<String> replicas;
 
     ReplicatedMergeTreeQuorumEntry() {}
@@ -35,6 +36,7 @@ struct ReplicatedMergeTreeQuorumEntry
             << "part_name: " << part_name << "\n"
             << "required_number_of_replicas: " << required_number_of_replicas << "\n"
             << "actual_number_of_replicas: " << replicas.size() << "\n"
+            << "is_parallel: " << is_parallel << "\n"
             << "replicas:\n";
 
         for (const auto & replica : replicas)
@@ -49,6 +51,7 @@ struct ReplicatedMergeTreeQuorumEntry
             >> "part_name: " >> part_name >> "\n"
             >> "required_number_of_replicas: " >> required_number_of_replicas >> "\n"
             >> "actual_number_of_replicas: " >> actual_number_of_replicas >> "\n"
+            >> "is_parallel: " >> is_parallel >> "\n"
             >> "replicas:\n";
 
         for (size_t i = 0; i < actual_number_of_replicas; ++i)

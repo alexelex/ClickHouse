@@ -2,6 +2,7 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeRestartingThread.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeQuorumParallelEntry.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeAddress.h>
 #include <Interpreters/Context.h>
 #include <Common/ZooKeeper/KeeperException.h>
@@ -223,17 +224,30 @@ void ReplicatedMergeTreeRestartingThread::updateQuorumIfWeHavePart()
 {
     auto zookeeper = storage.getZooKeeper();
 
-    String quorum_str;
-    if (zookeeper->tryGet(storage.zookeeper_path + "/quorum/status", quorum_str))
+    String parallel_str;
+    std::set<String> quorum_ids;
+    if (zookeeper->tryGet(storage.zookeeper_path + "/quorum/parallel", parallel_str))
     {
-        ReplicatedMergeTreeQuorumEntry quorum_entry;
-        quorum_entry.fromString(quorum_str);
+        ReplicatedMergeTreeQuorumParallelEntry parallel_entry;
+        parallel_entry.fromString(parallel_str);
+        quorum_ids = parallel_entry.part_names;
+    }
 
-        if (!quorum_entry.replicas.count(storage.replica_name)
-            && zookeeper->exists(storage.replica_path + "/parts/" + quorum_entry.part_name))
+    quorum_ids.insert(""); /// for unparallel quorum inserts
+    for (const auto& quorum_id : quorum_ids)
+    {
+        String quorum_str;
+        if (zookeeper->tryGet(storage.zookeeper_path + "/quorum/status" + quorum_id, quorum_str))
         {
-            LOG_WARNING(log, "We have part {} but we is not in quorum. Updating quorum. This shouldn't happen often.", quorum_entry.part_name);
-            storage.updateQuorum(quorum_entry.part_name);
+            ReplicatedMergeTreeQuorumEntry quorum_entry;
+            quorum_entry.fromString(quorum_str);
+
+            if (!quorum_entry.replicas.count(storage.replica_name)
+                && zookeeper->exists(storage.replica_path + "/parts/" + quorum_entry.part_name))
+            {
+                LOG_WARNING(log, "We have part {} but we is not in quorum. Updating quorum. This shouldn't happen often.", quorum_entry.part_name);
+                storage.updateQuorum(quorum_entry.part_name);
+            }
         }
     }
 }
